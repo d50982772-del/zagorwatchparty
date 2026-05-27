@@ -44,6 +44,10 @@ export default function RoomPage() {
    */
   const isApplyingRemoteAction = useRef(false);
 
+  // Останній стан кімнати в ref'і — щоб onReady міг прочитати його без closure-stale.
+  const roomRef = useRef<RoomState | null>(null);
+  roomRef.current = room;
+
   const inviteUrl = useMemo(() => {
     if (typeof window === "undefined") return "";
     return `${window.location.origin}/room/${roomId}`;
@@ -172,31 +176,31 @@ export default function RoomPage() {
       socket.off("video:pause", onVideoPause);
       socket.off("video:seek", onVideoSeek);
       socket.off("sync:correction", onSyncCorrection);
+      // Явно виходимо з кімнати на сервері, щоб після навігації не ловити
+      // play/pause/seek зі старої кімнати (сокет клієнта — сінглтон).
+      if (socket.connected) {
+        socket.emit("room:leave", { roomId });
+      }
     };
   }, [roomId]);
 
-  // --- Початкова синхронізація після приєднання + drift correction ---
-  useEffect(() => {
-    if (!room || !room.videoUrl || !playerRef.current) return;
-
-    // Одразу після того, як плеєр готовий, скоригуємо позицію під стан кімнати.
-    const target = expectedPosition(room);
+  // --- Початкова синхронізація після того, як VideoPlayer сигналізує onReady ---
+  async function handlePlayerReady() {
+    const r = roomRef.current;
+    if (!r || !r.videoUrl || !playerRef.current) return;
+    const target = expectedPosition(r);
     isApplyingRemoteAction.current = true;
-    (async () => {
-      try {
-        await playerRef.current?.seek(target);
-        if (room.isPlaying) {
-          await playerRef.current?.play();
-        } else {
-          await playerRef.current?.pause();
-        }
-      } finally {
-        setTimeout(() => (isApplyingRemoteAction.current = false), 100);
+    try {
+      await playerRef.current.seek(target);
+      if (r.isPlaying) {
+        await playerRef.current.play();
+      } else {
+        await playerRef.current.pause();
       }
-    })();
-    // Запускаємо одноразово на зміну URL, оскільки далі drift correction робить решту.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [room?.videoUrl]);
+    } finally {
+      setTimeout(() => (isApplyingRemoteAction.current = false), 100);
+    }
+  }
 
   // --- Drift correction: раз на 5 секунд звіряємо позицію ---
   useEffect(() => {
@@ -288,6 +292,7 @@ export default function RoomPage() {
               onLocalPause={handleLocalPause}
               onLocalSeek={handleLocalSeek}
               onError={(msg) => setPlayerError(msg)}
+              onReady={handlePlayerReady}
             />
           ) : (
             <div className="room__placeholder">

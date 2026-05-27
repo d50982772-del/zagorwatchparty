@@ -134,6 +134,7 @@ expectedPosition = currentTime + (Date.now() - updatedAt) / 1000
 | --------------- | -------------------------------------- | ------------------------------ |
 | `room:create`   | `{ videoUrl? }`                        | Створити нову кімнату          |
 | `room:join`     | `{ roomId }`                           | Приєднатись до існуючої        |
+| `room:leave`    | `{ roomId }`                           | Явно вийти з кімнати           |
 | `video:set`     | `{ roomId, videoUrl }`                 | Змінити джерело відео          |
 | `video:play`    | `{ roomId, currentTime }`              | Старт із часу                  |
 | `video:pause`   | `{ roomId, currentTime }`              | Пауза із часу                  |

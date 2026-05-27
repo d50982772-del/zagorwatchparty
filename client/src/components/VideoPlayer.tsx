@@ -19,6 +19,8 @@ interface Props {
   onLocalPause: () => void;
   onLocalSeek: (time: number) => void;
   onError: (msg: string | null) => void;
+  /** Викликається після того, як адаптер для цього URL повністю завантажився і готовий до seek/play/pause. */
+  onReady?: () => void;
 }
 
 /**
@@ -40,15 +42,15 @@ function createAdapter(url: string, container: HTMLElement): PlayerAdapter | nul
 }
 
 const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
-  { url, onLocalPlay, onLocalPause, onLocalSeek, onError },
+  { url, onLocalPlay, onLocalPause, onLocalSeek, onError, onReady },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const adapterRef = useRef<PlayerAdapter | null>(null);
 
   // Тримаємо актуальні колбеки в ref'ах, щоб не пересоздавати плеєр на кожен ререндер.
-  const cbsRef = useRef({ onLocalPlay, onLocalPause, onLocalSeek, onError });
-  cbsRef.current = { onLocalPlay, onLocalPause, onLocalSeek, onError };
+  const cbsRef = useRef({ onLocalPlay, onLocalPause, onLocalSeek, onError, onReady });
+  cbsRef.current = { onLocalPlay, onLocalPause, onLocalSeek, onError, onReady };
 
   useImperativeHandle(
     ref,
@@ -93,6 +95,7 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
           return;
         }
         adapterRef.current = adapter;
+        cbsRef.current.onReady?.();
       })
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : "Не вдалося завантажити відео";

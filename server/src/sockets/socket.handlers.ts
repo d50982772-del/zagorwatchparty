@@ -7,6 +7,9 @@ interface CreateRoomPayload {
 interface JoinRoomPayload {
   roomId: string;
 }
+interface LeaveRoomPayload {
+  roomId: string;
+}
 interface VideoSetPayload {
   roomId: string;
   videoUrl: string;
@@ -57,6 +60,18 @@ export function registerSocketHandlers(io: Server, socket: Socket): void {
     socket.emit("room:state", roomService.toDTO(room));
     // Решті — оновлений лічильник.
     io.to(room.roomId).emit("users:update", { participantsCount: room.participants.size });
+  });
+
+  // --- Вихід з кімнати (явний, без disconnect) ---
+  socket.on("room:leave", (payload: LeaveRoomPayload) => {
+    if (!payload?.roomId) return;
+    socket.leave(payload.roomId);
+    const updated = roomService.removeParticipant(payload.roomId, socket.id);
+    if (updated) {
+      io.to(updated.roomId).emit("users:update", {
+        participantsCount: updated.participants.size,
+      });
+    }
   });
 
   // --- Зміна джерела відео ---

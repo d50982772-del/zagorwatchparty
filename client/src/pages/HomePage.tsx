@@ -17,13 +17,38 @@ export default function HomePage() {
     function onDisconnect() {
       setConnected(false);
     }
+
+    function onCreated({ roomId }: { roomId: string }) {
+      setCreating(false);
+      navigate(`/room/${roomId}`);
+    }
+
+    function onRoomError(payload: { code: string; message: string }) {
+      setCreating(false);
+      setError(payload?.message || "Не вдалося створити кімнату");
+    }
+
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
+    socket.on("room:created", onCreated);
+    socket.on("room:error", onRoomError);
     return () => {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
+      socket.off("room:created", onCreated);
+      socket.off("room:error", onRoomError);
     };
-  }, []);
+  }, [navigate]);
+
+  // Якщо сервер не відповів за 10с — розблоковуємо кнопку, щоб юзер міг спробувати ще раз.
+  useEffect(() => {
+    if (!creating) return;
+    const timeout = window.setTimeout(() => {
+      setCreating(false);
+      setError("Сервер не відповів. Перевірте зʼєднання і спробуйте ще раз.");
+    }, 10000);
+    return () => window.clearTimeout(timeout);
+  }, [creating]);
 
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -39,12 +64,6 @@ export default function HomePage() {
 
     setCreating(true);
     socket.emit("room:create", { videoUrl: trimmed || undefined });
-
-    const onCreated = ({ roomId }: { roomId: string }) => {
-      socket.off("room:created", onCreated);
-      navigate(`/room/${roomId}`);
-    };
-    socket.on("room:created", onCreated);
   }
 
   return (
