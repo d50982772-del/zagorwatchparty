@@ -6,6 +6,16 @@ import type { Room, RoomStateDTO } from "./room.types";
 const generateRoomId = customAlphabet("23456789abcdefghjkmnpqrstuvwxyz", 8);
 
 /**
+ * Скільки часу тримати порожню кімнату в пам'яті, перш ніж видалити її.
+ * 60 с покриває:
+ *  - React 18 StrictMode mount→cleanup→mount у dev (без цього кімната б видалялася
+ *    між cleanup і re-mount і user бачив би "Кімнату не знайдено");
+ *  - "осиротілі" кімнати, в яких хост ніколи не викликав room:join;
+ *  - короткі мережеві обриви, коли останній учасник відпав і відразу реконнектився.
+ */
+export const ROOM_GRACE_MS = 60_000;
+
+/**
  * In-memory сховище кімнат. Для MVP цього достатньо: при перезапуску сервера
  * кімнати губляться, і це нормально.
  *
@@ -17,15 +27,18 @@ class RoomService {
   createRoom(hostSocketId: string, videoUrl?: string): Room {
     const roomId = generateRoomId();
     const url = videoUrl?.trim() || null;
+    const now = Date.now();
     const room: Room = {
       roomId,
       videoUrl: url,
       sourceType: url ? detectSourceType(url) : "unknown",
       isPlaying: false,
       currentTime: 0,
-      updatedAt: Date.now(),
+      updatedAt: now,
       hostId: hostSocketId,
       participants: new Set<string>(),
+      // Свіжо створена кімната порожня, поки host не викликав room:join.
+      emptySince: now,
     };
     this.rooms.set(roomId, room);
     return room;
@@ -39,18 +52,49 @@ class RoomService {
     const room = this.rooms.get(roomId);
     if (!room) return undefined;
     room.participants.add(socketId);
+    // У кімнаті з'явився хтось — скасовуємо таймер на видалення.
+    room.emptySince = null;
     return room;
   }
 
+  /**
+   * Не видаляємо кімнату одразу, коли останній учасник вийшов — лише
+   * позначаємо час початку порожнечі. Періодичний sweep() прибере пізніше,
+   * якщо ніхто так і не повернеться у grace period. Це робить кімнату стійкою
+   * до React StrictMode mount→cleanup→mount в dev.
+   */
   removeParticipant(roomId: string, socketId: string): Room | undefined {
     const room = this.rooms.get(roomId);
     if (!room) return undefined;
     room.participants.delete(socketId);
     if (room.participants.size === 0) {
-      this.rooms.delete(roomId);
-      return undefined;
+      room.emptySince = Date.now();
     }
     return room;
+  }
+
+  /**
+   * Перевірка приналежності — використовуємо, щоб video:play / pause / seek / set
+   * від сторонніх сокетів не могли впливати на чужу кімнату.
+   */
+  isParticipant(roomId: string, socketId: string): boolean {
+    const room = this.rooms.get(roomId);
+    return room?.participants.has(socketId) ?? false;
+  }
+
+  /**
+   * Видаляє кімнати, які залишаються порожніми довше, ніж ROOM_GRACE_MS.
+   * Повертає кількість видалених (для логування / тестів).
+   */
+  sweepStaleRooms(graceMs = ROOM_GRACE_MS, now: number = Date.now()): number {
+    let removed = 0;
+    for (const [id, room] of this.rooms) {
+      if (room.emptySince !== null && now - room.emptySince > graceMs) {
+        this.rooms.delete(id);
+        removed += 1;
+      }
+    }
+    return removed;
   }
 
   /** Знаходимо всі кімнати, у яких є цей сокет. Потрібно при disconnect. */

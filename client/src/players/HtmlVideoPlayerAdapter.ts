@@ -7,7 +7,19 @@ import type { PlayerAdapter } from "./PlayerAdapter";
 export class HtmlVideoPlayerAdapter implements PlayerAdapter {
   protected container: HTMLElement;
   protected video: HTMLVideoElement;
-  protected suppressEvents = false;
+  /**
+   * Лічильник замість boolean: коли в одній мікро-черзі робимо seek()→play(),
+   * два паралельні setTimeout(0) на реліз guard’а не повинні дозволити першому
+   * зняти guard, поки другий ще в польоті. handle*() ігнорують події, поки
+   * лічильник > 0.
+   */
+  protected suppressDepth = 0;
+  /**
+   * Якщо load() ще в польоті — це функція, яка викине його promise з rejection
+   * і прибере слухачі. destroy() викликає її, щоб не залишити висячих слухачів
+   * (loadedmetadata/error) на відкріпленому <video> елементі.
+   */
+  private loadAbort: (() => void) | null = null;
 
   onPlay?: () => void;
   onPause?: () => void;
@@ -29,19 +41,38 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
   }
 
   protected handlePlay = (): void => {
-    if (this.suppressEvents) return;
+    if (this.suppressDepth > 0) return;
     this.onPlay?.();
   };
 
   protected handlePause = (): void => {
-    if (this.suppressEvents) return;
+    if (this.suppressDepth > 0) return;
     this.onPause?.();
   };
 
   protected handleSeeked = (): void => {
-    if (this.suppressEvents) return;
+    if (this.suppressDepth > 0) return;
     this.onSeek?.(this.video.currentTime);
   };
+
+  /**
+   * Приватний хелпер: иncrement, виконати програмну дію, потім в наступному macrotask
+   * декрементнути. Якщо між цим був ще один виклик (напр. seek→play), лічильник
+   * все одно залишається > 0, поки другий виклик не завершиться — жодних leak’ів.
+   */
+  private withSuppression(): () => void {
+    this.suppressDepth += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      // setTimeout 0, щоб вже вже поставлені в чергу "play"/"pause"/"seeked" події
+      // встигли відфільтруватися до того, як лічильник впаде до 0.
+      setTimeout(() => {
+        this.suppressDepth = Math.max(0, this.suppressDepth - 1);
+      }, 0);
+    };
+  }
 
   async load(url: string): Promise<void> {
     this.container.innerHTML = "";
@@ -49,41 +80,50 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
     this.container.appendChild(this.video);
     // Чекаємо завантаження метаданих, щоб getDuration() / seek() працювали стабільно.
     await new Promise<void>((resolve, reject) => {
-      const onLoaded = () => {
+      const cleanup = () => {
         this.video.removeEventListener("loadedmetadata", onLoaded);
         this.video.removeEventListener("error", onError);
+        this.loadAbort = null;
+      };
+      const onLoaded = () => {
+        cleanup();
         resolve();
       };
       const onError = () => {
-        this.video.removeEventListener("loadedmetadata", onLoaded);
-        this.video.removeEventListener("error", onError);
+        cleanup();
         reject(new Error("Не вдалося завантажити відео"));
       };
       this.video.addEventListener("loadedmetadata", onLoaded);
       this.video.addEventListener("error", onError);
+      // Якщо destroy() викликають, поки ми чекаємо loadedmetadata/error — без
+      // цього слухачі залишаються висіти на відкріпленому <video> разом з closures,
+      // а awaiting promise ніколи не settle'ився б.
+      this.loadAbort = () => {
+        cleanup();
+        reject(new Error("Адаптер знищено до завершення завантаження"));
+      };
     });
   }
 
   async play(): Promise<void> {
-    this.suppressEvents = true;
+    const release = this.withSuppression();
     try {
       await this.video.play();
     } catch {
       // Браузер міг заблокувати автоплей — це нормально, ігноруємо.
     } finally {
-      // Знімаємо guard після того, як подія play вже встигла спрацювати.
-      setTimeout(() => (this.suppressEvents = false), 0);
+      release();
     }
   }
 
   async pause(): Promise<void> {
-    this.suppressEvents = true;
+    const release = this.withSuppression();
     this.video.pause();
-    setTimeout(() => (this.suppressEvents = false), 0);
+    release();
   }
 
   async seek(time: number): Promise<void> {
-    this.suppressEvents = true;
+    const release = this.withSuppression();
     this.video.currentTime = time;
     // Подія seeked прийде асинхронно; залишаємо guard, поки вона не пройде.
     // Safety net: якщо `seeked` так і не випалить (відео в error state, відкріплене
@@ -102,7 +142,7 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
       timeoutId = window.setTimeout(finish, 3000);
       this.video.addEventListener("seeked", finish);
     });
-    setTimeout(() => (this.suppressEvents = false), 0);
+    release();
   }
 
   getTime(): number {
@@ -117,6 +157,9 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
     this.video.removeEventListener("play", this.handlePlay);
     this.video.removeEventListener("pause", this.handlePause);
     this.video.removeEventListener("seeked", this.handleSeeked);
+    // Якщо destroy викликали посеред load() — реджектимо awaiting promise
+    // і знімаємо loadedmetadata/error слухачі.
+    this.loadAbort?.();
     try {
       this.video.pause();
       this.video.removeAttribute("src");

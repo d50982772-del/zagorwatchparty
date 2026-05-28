@@ -1,6 +1,24 @@
 import type { Server, Socket } from "socket.io";
 import { roomService } from "../rooms/room.service";
 
+/** Жорстка верхня межа на довжину URL, щоб клієнт не міг "роздути" room state. */
+const MAX_VIDEO_URL_LENGTH = 2048;
+
+/**
+ * Дозволяємо тільки http / https. Це не повноцінна санітизація (frontend все одно
+ * має свій detectSourceType), але блокує javascript:, data:, file: і подібні
+ * URL'и до того, як вони потраплять у broadcast іншим учасникам.
+ */
+function isAllowedVideoUrl(url: string): boolean {
+  if (url.length === 0 || url.length > MAX_VIDEO_URL_LENGTH) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 interface CreateRoomPayload {
   videoUrl?: string;
 }
@@ -41,7 +59,17 @@ interface SyncRequestPayload {
 export function registerSocketHandlers(io: Server, socket: Socket): void {
   // --- Створення кімнати ---
   socket.on("room:create", (payload: CreateRoomPayload = {}) => {
-    const room = roomService.createRoom(socket.id, payload.videoUrl);
+    // Порожній / відсутній URL дозволений (можна задати пізніше через video:set).
+    // Якщо URL переданий — має бути валідним http(s).
+    const url = typeof payload?.videoUrl === "string" ? payload.videoUrl.trim() : "";
+    if (url && !isAllowedVideoUrl(url)) {
+      socket.emit("room:error", {
+        code: "INVALID_URL",
+        message: "Непідтримуваний URL відео (потрібний http або https).",
+      });
+      return;
+    }
+    const room = roomService.createRoom(socket.id, url || undefined);
     socket.emit("room:created", { roomId: room.roomId });
   });
 
@@ -77,7 +105,16 @@ export function registerSocketHandlers(io: Server, socket: Socket): void {
   // --- Зміна джерела відео ---
   socket.on("video:set", (payload: VideoSetPayload) => {
     if (!payload?.roomId || typeof payload.videoUrl !== "string") return;
-    const room = roomService.setVideo(payload.roomId, payload.videoUrl);
+    if (!roomService.isParticipant(payload.roomId, socket.id)) return;
+    const url = payload.videoUrl.trim();
+    if (!isAllowedVideoUrl(url)) {
+      socket.emit("room:error", {
+        code: "INVALID_URL",
+        message: "Непідтримуваний URL відео (потрібний http або https).",
+      });
+      return;
+    }
+    const room = roomService.setVideo(payload.roomId, url);
     if (!room) {
       socket.emit("room:error", { code: "ROOM_NOT_FOUND", message: "Кімнату не знайдено" });
       return;
@@ -92,8 +129,11 @@ export function registerSocketHandlers(io: Server, socket: Socket): void {
   });
 
   // --- Play / Pause / Seek ---
+  // Всі три вимагають, щоб відправник був учасником кімнати — інакше будь-який
+  // підключений сокет, який вгадав roomId, міг би ламати чужий перегляд.
   socket.on("video:play", (payload: VideoPlayPayload) => {
     if (!payload?.roomId) return;
+    if (!roomService.isParticipant(payload.roomId, socket.id)) return;
     const room = roomService.setPlaying(payload.roomId, Number(payload.currentTime) || 0);
     if (!room) return;
     socket.to(room.roomId).emit("video:play", {
@@ -104,6 +144,7 @@ export function registerSocketHandlers(io: Server, socket: Socket): void {
 
   socket.on("video:pause", (payload: VideoPausePayload) => {
     if (!payload?.roomId) return;
+    if (!roomService.isParticipant(payload.roomId, socket.id)) return;
     const room = roomService.setPaused(payload.roomId, Number(payload.currentTime) || 0);
     if (!room) return;
     socket.to(room.roomId).emit("video:pause", {
@@ -114,6 +155,7 @@ export function registerSocketHandlers(io: Server, socket: Socket): void {
 
   socket.on("video:seek", (payload: VideoSeekPayload) => {
     if (!payload?.roomId) return;
+    if (!roomService.isParticipant(payload.roomId, socket.id)) return;
     const room = roomService.setSeek(payload.roomId, Number(payload.currentTime) || 0);
     if (!room) return;
     socket.to(room.roomId).emit("video:seek", {
@@ -125,6 +167,7 @@ export function registerSocketHandlers(io: Server, socket: Socket): void {
   // --- Запит на ресинхронізацію (drift correction) ---
   socket.on("sync:request", (payload: SyncRequestPayload) => {
     if (!payload?.roomId) return;
+    if (!roomService.isParticipant(payload.roomId, socket.id)) return;
     const room = roomService.getRoom(payload.roomId);
     if (!room) return;
     socket.emit("sync:correction", roomService.toDTO(room));
