@@ -37,6 +37,13 @@ interface YTPlayerOptions {
   };
 }
 
+/** Якщо очікувана подія так і не приходить (наприклад, YouTube не зміг почати
+ * відтворення через autoplay-блок), знімаємо guard самі — інакше всі наступні
+ * локальні play/pause перестануть пересилатися на сервер. */
+const PENDING_STATE_TIMEOUT_MS = 4000;
+
+const API_LOAD_TIMEOUT_MS = 10_000;
+
 let apiPromise: Promise<void> | null = null;
 
 /** Завантажуємо YouTube IFrame API лише один раз на весь додаток. */
@@ -44,14 +51,39 @@ function loadYouTubeApi(): Promise<void> {
   if (window.YT && window.YT.Player) return Promise.resolve();
   if (apiPromise) return apiPromise;
 
-  apiPromise = new Promise<void>((resolve) => {
+  apiPromise = new Promise<void>((resolve, reject) => {
     const tag = document.createElement("script");
     tag.src = "https://www.youtube.com/iframe_api";
+
+    let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Дозволимо повторну спробу після зникнення проблеми.
+      apiPromise = null;
+      reject(
+        new Error(
+          "Не вдалося завантажити YouTube IFrame API (timeout). Можливо, заблоковано розширенням або мережею."
+        )
+      );
+    }, API_LOAD_TIMEOUT_MS);
+
+    tag.onerror = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      apiPromise = null;
+      reject(new Error("Не вдалося завантажити YouTube IFrame API."));
+    };
+
     document.head.appendChild(tag);
 
     const prev = window.onYouTubeIframeAPIReady;
     window.onYouTubeIframeAPIReady = () => {
       prev?.();
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
       resolve();
     };
   });
@@ -63,8 +95,22 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
   private player: YTPlayer | null = null;
   private lastKnownTime = 0;
   private playing = false;
-  /** Внутрішній прапорець, щоб ігнорувати state change від нашого власного play/pause. */
-  private suppressEvents = false;
+
+  /**
+   * Скільки очікуваних state-change подій ми ще не "поглинули".
+   * YouTube `onStateChange(PLAYING|PAUSED)` приходить асинхронно (від ~100ms до ~1s
+   * залежно від буферизації), тому пласкі `setTimeout`-guard'и недостатні.
+   * Замість цього лічимо: коли ми самі викликаємо `play()` — pendingPlay++; коли
+   * приходить PLAYING — pendingPlay--. Якщо лічильник > 0 — це наш власний виклик,
+   * не пересилаємо назад. Інакше — це користувач натиснув плеєр сам.
+   *
+   * Таймер — лише safety net на випадок, якщо очікуваний state так і не прийде
+   * (наприклад, autoplay заблокований).
+   */
+  private pendingPlay = 0;
+  private pendingPause = 0;
+  private pendingPlayTimer: number | null = null;
+  private pendingPauseTimer: number | null = null;
 
   onPlay?: () => void;
   onPause?: () => void;
@@ -113,45 +159,84 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
   private handleStateChange(state: number): void {
     if (!window.YT) return;
     const YT = window.YT;
-    if (this.suppressEvents) return;
 
     if (state === YT.PlayerState.PLAYING) {
       this.playing = true;
       this.lastKnownTime = this.player?.getCurrentTime() ?? this.lastKnownTime;
+      // Якщо PLAYING — це відповідь на наш програмний play(), просто поглинаємо.
+      if (this.consumePendingPlay()) return;
       this.onPlay?.();
     } else if (state === YT.PlayerState.PAUSED) {
       this.playing = false;
       const t = this.player?.getCurrentTime() ?? this.lastKnownTime;
-      // Якщо позиція суттєво відрізняється від останньої — трактуємо як seek+pause.
-      if (Math.abs(t - this.lastKnownTime) > 1) {
+      const suppressed = this.consumePendingPause();
+      // Seek + pause користувача: якщо позиція суттєво відрізняється — це seek.
+      // Не пересилаємо, якщо це наш програмний pause.
+      if (!suppressed && Math.abs(t - this.lastKnownTime) > 1) {
         this.onSeek?.(t);
       }
       this.lastKnownTime = t;
+      if (suppressed) return;
       this.onPause?.();
     }
   }
 
+  private consumePendingPlay(): boolean {
+    if (this.pendingPlay <= 0) return false;
+    this.pendingPlay -= 1;
+    if (this.pendingPlay === 0 && this.pendingPlayTimer !== null) {
+      window.clearTimeout(this.pendingPlayTimer);
+      this.pendingPlayTimer = null;
+    }
+    return true;
+  }
+
+  private consumePendingPause(): boolean {
+    if (this.pendingPause <= 0) return false;
+    this.pendingPause -= 1;
+    if (this.pendingPause === 0 && this.pendingPauseTimer !== null) {
+      window.clearTimeout(this.pendingPauseTimer);
+      this.pendingPauseTimer = null;
+    }
+    return true;
+  }
+
+  private armPendingPlay(): void {
+    this.pendingPlay += 1;
+    if (this.pendingPlayTimer !== null) window.clearTimeout(this.pendingPlayTimer);
+    this.pendingPlayTimer = window.setTimeout(() => {
+      this.pendingPlay = 0;
+      this.pendingPlayTimer = null;
+    }, PENDING_STATE_TIMEOUT_MS);
+  }
+
+  private armPendingPause(): void {
+    this.pendingPause += 1;
+    if (this.pendingPauseTimer !== null) window.clearTimeout(this.pendingPauseTimer);
+    this.pendingPauseTimer = window.setTimeout(() => {
+      this.pendingPause = 0;
+      this.pendingPauseTimer = null;
+    }, PENDING_STATE_TIMEOUT_MS);
+  }
+
   async play(): Promise<void> {
     if (!this.player) return;
-    this.suppressEvents = true;
+    this.armPendingPlay();
     this.player.playVideo();
-    // YouTube не повертає Promise, тож знімаємо guard у наступному тіку.
-    setTimeout(() => (this.suppressEvents = false), 0);
   }
 
   async pause(): Promise<void> {
     if (!this.player) return;
-    this.suppressEvents = true;
+    this.armPendingPause();
     this.player.pauseVideo();
-    setTimeout(() => (this.suppressEvents = false), 0);
   }
 
   async seek(time: number): Promise<void> {
     if (!this.player) return;
-    this.suppressEvents = true;
-    this.player.seekTo(time, true);
+    // Оновлюємо lastKnownTime ДО seekTo — щоб у handleStateChange різниця з
+    // фактичним currentTime була ~0 і ми не сприйняли seek як користувацький.
     this.lastKnownTime = time;
-    setTimeout(() => (this.suppressEvents = false), 50);
+    this.player.seekTo(time, true);
   }
 
   getTime(): number {
@@ -164,6 +249,14 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
   }
 
   destroy(): void {
+    if (this.pendingPlayTimer !== null) {
+      window.clearTimeout(this.pendingPlayTimer);
+      this.pendingPlayTimer = null;
+    }
+    if (this.pendingPauseTimer !== null) {
+      window.clearTimeout(this.pendingPauseTimer);
+      this.pendingPauseTimer = null;
+    }
     try {
       this.player?.destroy();
     } catch {

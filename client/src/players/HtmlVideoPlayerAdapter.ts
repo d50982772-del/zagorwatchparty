@@ -86,12 +86,21 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
     this.suppressEvents = true;
     this.video.currentTime = time;
     // Подія seeked прийде асинхронно; залишаємо guard, поки вона не пройде.
+    // Safety net: якщо `seeked` так і не випалить (відео в error state, відкріплене
+    // від DOM, seek поза тривалістю) — таймаут не дає promise висіти вічно і
+    // блокувати drift correction / remote-обробники в RoomPage.
     await new Promise<void>((resolve) => {
-      const done = () => {
-        this.video.removeEventListener("seeked", done);
+      let settled = false;
+      let timeoutId: number | null = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        this.video.removeEventListener("seeked", finish);
+        if (timeoutId !== null) window.clearTimeout(timeoutId);
         resolve();
       };
-      this.video.addEventListener("seeked", done);
+      timeoutId = window.setTimeout(finish, 3000);
+      this.video.addEventListener("seeked", finish);
     });
     setTimeout(() => (this.suppressEvents = false), 0);
   }

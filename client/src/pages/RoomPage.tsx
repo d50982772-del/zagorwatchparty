@@ -203,13 +203,19 @@ export default function RoomPage() {
   }
 
   // --- Drift correction: раз на 5 секунд звіряємо позицію ---
+  // Залежність — лише `roomId`: інтервал має жити рівно один раз на кімнату.
+  // Якби тут стояло `[room]`, кожен `users:update` / `video:play` / `video:seek`
+  // створював би нову object reference → useEffect перезапускався б → інтервал
+  // постійно скидався і реально ніколи не "достигав" 5 секунд. Актуальний стан
+  // читаємо з `roomRef.current` всередині callback'у.
   useEffect(() => {
     const interval = setInterval(async () => {
-      if (!room || !playerRef.current || !room.videoUrl) return;
+      const r = roomRef.current;
+      if (!r || !playerRef.current || !r.videoUrl) return;
       // Не коригуємо, поки ми посеред застосування remote-команди.
       if (isApplyingRemoteAction.current) return;
 
-      const expected = expectedPosition(room);
+      const expected = expectedPosition(r);
       const actual = playerRef.current.getTime();
       const diff = Math.abs(actual - expected);
 
@@ -224,7 +230,7 @@ export default function RoomPage() {
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [room]);
+  }, [roomId]);
 
   // --- Локальні події плеєра: відправляємо на сервер ---
   function handleLocalPlay() {
