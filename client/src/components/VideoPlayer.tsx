@@ -90,14 +90,18 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
     adapter
       .load(url)
       .then(() => {
-        if (cancelled) {
-          adapter.destroy();
-          return;
-        }
+        // Якщо ефект був скасований — cleanup уже викликав adapter.destroy().
+        // Викликати destroy ще раз не можна: контейнер шарений, новий adapter
+        // вже міг покласти в нього свій <video> — destroy очистить чужий DOM.
+        if (cancelled) return;
         adapterRef.current = adapter;
         cbsRef.current.onReady?.();
       })
       .catch((err: unknown) => {
+        // Той самий race-кейс: load старого URL зарезолвився rejection після
+        // того, як cleanup уже знищив цей адаптер і ми перейшли на новий URL.
+        // Не показуємо застарілу помилку і не торкаємось чужого контейнера.
+        if (cancelled) return;
         const msg = err instanceof Error ? err.message : "Не вдалося завантажити відео";
         cbsRef.current.onError(msg);
         adapter.destroy();
