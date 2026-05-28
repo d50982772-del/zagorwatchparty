@@ -38,11 +38,40 @@ export default function RoomPage() {
   const playerRef = useRef<VideoPlayerHandle | null>(null);
 
   /**
-   * isApplyingRemoteAction — захист від циклічних подій. Коли ми отримуємо
-   * команду від сервера і застосовуємо її локально, плеєр може випалити
-   * власну play/pause/seek подію. Цей прапорець каже їй: «не шли назад».
+   * Захист від циклічних подій. Коли ми отримуємо команду від сервера і
+   * застосовуємо її локально, плеєр може випалити власну play/pause/seek
+   * подію — ми не повинні слати її назад.
+   *
+   * Лічильник, а не boolean: якщо два remote-event'и накладаються (наприклад,
+   * швидке pause+seek в одного учасника, перші 50ms ще не минули), boolean
+   * скидав би guard передчасно — другий `setTimeout(50)` зняв би прапорець
+   * поки перший ще "у польоті". З depth-counter обидва release'и спершу
+   * декрементять, і `> 0` лишається істинним, поки і другий не релізиться.
    */
-  const isApplyingRemoteAction = useRef(false);
+  const remoteActionDepth = useRef(0);
+
+  /**
+   * Інкремент depth, повертає release() з setTimeout-декрементом.
+   * delayMs контролює, скільки тримати guard після завершення await-чейну —
+   * це форум для повільних async-подій плеєра (наприклад YouTube state change
+   * приходить через ~100-500ms після playVideo()).
+   */
+  function beginRemoteAction(delayMs = 50): () => void {
+    remoteActionDepth.current += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      setTimeout(() => {
+        remoteActionDepth.current = Math.max(0, remoteActionDepth.current - 1);
+      }, delayMs);
+    };
+  }
+
+  /** Чи зараз застосовуємо remote-команду — для guard'ів у локальних обробниках. */
+  function isApplyingRemoteAction(): boolean {
+    return remoteActionDepth.current > 0;
+  }
 
   // Останній стан кімнати в ref'і — щоб onReady міг прочитати його без closure-stale.
   const roomRef = useRef<RoomState | null>(null);
@@ -107,37 +136,36 @@ export default function RoomPage() {
     async function onVideoPlay(payload: { currentTime: number; updatedAt: number }) {
       setRoom((r) => (r ? { ...r, isPlaying: true, ...payload } : r));
       if (!playerRef.current) return;
-      isApplyingRemoteAction.current = true;
+      const release = beginRemoteAction();
       try {
         // Підтягуємо позицію перед play, щоб не стартувати "зі старого часу".
         await playerRef.current.seek(payload.currentTime);
         await playerRef.current.play();
       } finally {
-        // Невеликий timeout, щоб дочекатися eventів плеєра.
-        setTimeout(() => (isApplyingRemoteAction.current = false), 50);
+        release();
       }
     }
 
     async function onVideoPause(payload: { currentTime: number; updatedAt: number }) {
       setRoom((r) => (r ? { ...r, isPlaying: false, ...payload } : r));
       if (!playerRef.current) return;
-      isApplyingRemoteAction.current = true;
+      const release = beginRemoteAction();
       try {
         await playerRef.current.pause();
         await playerRef.current.seek(payload.currentTime);
       } finally {
-        setTimeout(() => (isApplyingRemoteAction.current = false), 50);
+        release();
       }
     }
 
     async function onVideoSeek(payload: { currentTime: number; updatedAt: number }) {
       setRoom((r) => (r ? { ...r, ...payload } : r));
       if (!playerRef.current) return;
-      isApplyingRemoteAction.current = true;
+      const release = beginRemoteAction();
       try {
         await playerRef.current.seek(payload.currentTime);
       } finally {
-        setTimeout(() => (isApplyingRemoteAction.current = false), 50);
+        release();
       }
     }
 
@@ -145,13 +173,13 @@ export default function RoomPage() {
       setRoom(state);
       if (!playerRef.current || !state.videoUrl) return;
       const target = expectedPosition(state);
-      isApplyingRemoteAction.current = true;
+      const release = beginRemoteAction(100);
       try {
         await playerRef.current.seek(target);
         if (state.isPlaying) await playerRef.current.play();
         else await playerRef.current.pause();
       } finally {
-        setTimeout(() => (isApplyingRemoteAction.current = false), 100);
+        release();
       }
     }
 
@@ -197,7 +225,7 @@ export default function RoomPage() {
     const r = roomRef.current;
     if (!r || !r.videoUrl || !playerRef.current) return;
     const target = expectedPosition(r);
-    isApplyingRemoteAction.current = true;
+    const release = beginRemoteAction(100);
     try {
       await playerRef.current.seek(target);
       if (r.isPlaying) {
@@ -206,7 +234,7 @@ export default function RoomPage() {
         await playerRef.current.pause();
       }
     } finally {
-      setTimeout(() => (isApplyingRemoteAction.current = false), 100);
+      release();
     }
   }
 
@@ -221,7 +249,7 @@ export default function RoomPage() {
       const r = roomRef.current;
       if (!r || !playerRef.current || !r.videoUrl) return;
       // Не коригуємо, поки ми посеред застосування remote-команди.
-      if (isApplyingRemoteAction.current) return;
+      if (isApplyingRemoteAction()) return;
 
       const expected = expectedPosition(r);
       const actual = playerRef.current.getTime();
@@ -229,11 +257,11 @@ export default function RoomPage() {
 
       // Поріг 1.5с — нижче нього не чіпаємо, щоб не сіпало.
       if (diff > 1.5) {
-        isApplyingRemoteAction.current = true;
+        const release = beginRemoteAction(100);
         try {
           await playerRef.current.seek(expected);
         } finally {
-          setTimeout(() => (isApplyingRemoteAction.current = false), 100);
+          release();
         }
       }
     }, 5000);
@@ -242,19 +270,19 @@ export default function RoomPage() {
 
   // --- Локальні події плеєра: відправляємо на сервер ---
   function handleLocalPlay() {
-    if (isApplyingRemoteAction.current) return;
+    if (isApplyingRemoteAction()) return;
     const t = playerRef.current?.getTime() ?? 0;
     socket.emit("video:play", { roomId, currentTime: t });
   }
 
   function handleLocalPause() {
-    if (isApplyingRemoteAction.current) return;
+    if (isApplyingRemoteAction()) return;
     const t = playerRef.current?.getTime() ?? 0;
     socket.emit("video:pause", { roomId, currentTime: t });
   }
 
   function handleLocalSeek(time: number) {
-    if (isApplyingRemoteAction.current) return;
+    if (isApplyingRemoteAction()) return;
     socket.emit("video:seek", { roomId, currentTime: time });
   }
 

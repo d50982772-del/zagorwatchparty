@@ -44,6 +44,13 @@ const PENDING_STATE_TIMEOUT_MS = 4000;
 
 const API_LOAD_TIMEOUT_MS = 10_000;
 
+/** Скільки чекати, поки `new YT.Player()` випалить onReady, перш ніж здатися.
+ * Це окремий етап від API-load: API вже завантажене, але ініціалізація плеєра
+ * може зависнути через CSP, обмеження embeddable у відео, або відсутність
+ * мережі. Без цього таймауту `load()` висить вічно — VideoPlayer не показує
+ * помилку, не створює retry-можливості. */
+const PLAYER_READY_TIMEOUT_MS = 15_000;
+
 let apiPromise: Promise<void> | null = null;
 
 /** Завантажуємо YouTube IFrame API лише один раз на весь додаток. */
@@ -112,6 +119,10 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
   private pendingPlayTimer: number | null = null;
   private pendingPauseTimer: number | null = null;
 
+  /** Якщо load() ще в польоті — функція, яка реджектить його promise і прибирає
+   * слухачі / таймери. destroy() викликає її, щоб не залишити висячий promise. */
+  private loadAbort: (() => void) | null = null;
+
   onPlay?: () => void;
   onPause?: () => void;
   onSeek?: (time: number) => void;
@@ -137,7 +148,42 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
     this.container.innerHTML = "";
     this.container.appendChild(host);
 
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timeoutId: number | null = null;
+      const cleanup = () => {
+        if (timeoutId !== null) {
+          window.clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        this.loadAbort = null;
+      };
+      timeoutId = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        // Плеєр міг вже частково побудуватися — прибираємо їх і очищуємо
+        // перереференс, щоб destroy() не робив двоваріантної роботи.
+        try {
+          this.player?.destroy();
+        } catch {
+          /* noop */
+        }
+        this.player = null;
+        reject(
+          new Error(
+            "Не вдалося ініціалізувати YouTube-плеєр (таймаут). Можливо, відео заблоковане для вбудовування."
+          )
+        );
+      }, PLAYER_READY_TIMEOUT_MS);
+
+      this.loadAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error("Адаптер знищено до завершення завантаження"));
+      };
+
       const YT = window.YT!;
       this.player = new YT.Player(host, {
         videoId,
@@ -149,7 +195,12 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
           playsinline: 1,
         },
         events: {
-          onReady: () => resolve(),
+          onReady: () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve();
+          },
           onStateChange: (e) => this.handleStateChange(e.data),
         },
       });
@@ -257,6 +308,8 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
       window.clearTimeout(this.pendingPauseTimer);
       this.pendingPauseTimer = null;
     }
+    // Якщо load() ще в польоті — реджектимо promise, розбираємо таймер.
+    this.loadAbort?.();
     try {
       this.player?.destroy();
     } catch {

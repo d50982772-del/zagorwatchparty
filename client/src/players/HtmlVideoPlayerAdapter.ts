@@ -17,9 +17,10 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
   /**
    * Якщо load() ще в польоті — це функція, яка викине його promise з rejection
    * і прибере слухачі. destroy() викликає її, щоб не залишити висячих слухачів
-   * (loadedmetadata/error) на відкріпленому <video> елементі.
+   * (loadedmetadata/error) на відкріпленому <video> елементі. Protected, бо
+   * HlsVideoPlayerAdapter перевизначає load() і виставляє свій loadAbort.
    */
-  private loadAbort: (() => void) | null = null;
+  protected loadAbort: (() => void) | null = null;
 
   onPlay?: () => void;
   onPause?: () => void;
