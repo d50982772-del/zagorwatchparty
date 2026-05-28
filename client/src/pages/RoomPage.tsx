@@ -68,7 +68,15 @@ export default function RoomPage() {
     }
 
     function onRoomError(payload: { code: string; message: string }) {
-      setError(payload?.message || "Помилка кімнати");
+      // ROOM_NOT_FOUND — фатально (кімнати немає, кімнатну сторінку нічого показувати).
+      // Решта (INVALID_URL і подібні валідаційні помилки) — нефатальні: показуємо
+      // інлайн повідомлення у плеєрі, кімната залишається робочою.
+      const msg = payload?.message || "Помилка кімнати";
+      if (payload?.code === "ROOM_NOT_FOUND") {
+        setError(msg);
+      } else {
+        setPlayerError(msg);
+      }
     }
 
     function onUsersUpdate(payload: { participantsCount: number }) {
