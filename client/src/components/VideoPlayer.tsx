@@ -1,4 +1,4 @@
-import { useEffect, useImperativeHandle, useRef, forwardRef } from "react";
+import { useEffect, useImperativeHandle, useRef, forwardRef, useState } from "react";
 import type { PlayerAdapter } from "../players/PlayerAdapter";
 import { YouTubePlayerAdapter } from "../players/YouTubePlayerAdapter";
 import { HtmlVideoPlayerAdapter } from "../players/HtmlVideoPlayerAdapter";
@@ -47,6 +47,10 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const adapterRef = useRef<PlayerAdapter | null>(null);
+  // Поки адаптер вже створений, але `onReady` ще не випалив — шоуємо
+  // overlay-спінер. Для YouTube це рятує від "чорний прямокутник, незрозуміло
+  // чи він взагалі вантажиться"; для HLS/HTML — від "нічого не відбувається".
+  const [loading, setLoading] = useState(false);
 
   // Тримаємо актуальні колбеки в ref'ах, щоб не пересоздавати плеєр на кожен ререндер.
   const cbsRef = useRef({ onLocalPlay, onLocalPause, onLocalSeek, onError, onReady });
@@ -76,13 +80,18 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
     adapterRef.current?.destroy();
     adapterRef.current = null;
 
-    if (!url) return;
+    if (!url) {
+      setLoading(false);
+      return;
+    }
 
     const adapter = createAdapter(url, container);
     if (!adapter) {
       cbsRef.current.onError("Це джерело відео не підтримується");
+      setLoading(false);
       return;
     }
+    setLoading(true);
     adapter.onPlay = () => cbsRef.current.onLocalPlay();
     adapter.onPause = () => cbsRef.current.onLocalPause();
     adapter.onSeek = (t) => cbsRef.current.onLocalSeek(t);
@@ -101,6 +110,7 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
         // вже міг покласти в нього свій <video> — destroy очистить чужий DOM.
         if (cancelled) return;
         adapterRef.current = adapter;
+        setLoading(false);
         cbsRef.current.onReady?.();
       })
       .catch((err: unknown) => {
@@ -110,6 +120,7 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
         if (cancelled) return;
         const msg = err instanceof Error ? err.message : "Не вдалося завантажити відео";
         cbsRef.current.onError(msg);
+        setLoading(false);
         adapter.destroy();
       });
 
@@ -120,7 +131,17 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
     };
   }, [url]);
 
-  return <div className="video-player" ref={containerRef} />;
+  return (
+    <div className="video-player">
+      <div className="video-player__stage" ref={containerRef} />
+      {loading && (
+        <div className="video-player__loading" role="status" aria-live="polite">
+          <div className="video-player__spinner" />
+          <span>Завантажуємо плеєр…</span>
+        </div>
+      )}
+    </div>
+  );
 });
 
 export default VideoPlayer;

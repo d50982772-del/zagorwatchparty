@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface Props {
   roomId: string;
@@ -8,6 +8,8 @@ interface Props {
   connected: boolean;
 }
 
+type CopyState = "idle" | "copied" | "manual";
+
 export default function RoomControls({
   roomId,
   inviteUrl,
@@ -15,24 +17,58 @@ export default function RoomControls({
   onChangeVideo,
   connected,
 }: Props) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<CopyState>("idle");
   const [draftUrl, setDraftUrl] = useState("");
+  /**
+   * URL, який користувач щойно надіслав на сервер. Тримаємо у полі (input lишається
+   * "сабмічений") аж поки сервер не підтвердить через `video:set` (тоді
+   * `currentVideoUrl` зміниться на нього і ми очистимо поле). Якщо сервер
+   * відмовив — поле лишається, користувач може поправити URL і пере-сабмітити.
+   */
+  const pendingUrl = useRef<string | null>(null);
+
+  // Очищаємо поле тільки після того, як сервер реально прийняв URL і він повернувся
+  // у room state. До цього моменту користувач бачить свій ввід (на випадок відмови).
+  useEffect(() => {
+    if (pendingUrl.current && currentVideoUrl === pendingUrl.current) {
+      pendingUrl.current = null;
+      setDraftUrl("");
+    }
+  }, [currentVideoUrl]);
 
   async function copy(): Promise<void> {
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(inviteUrl);
+        setCopyState("copied");
+        window.setTimeout(() => setCopyState("idle"), 1500);
+        return;
+      } catch {
+        // Дозвіл відмовлено / SecurityError — падаємо у legacy-fallback нижче.
+      }
+    }
+    // execCommand fallback. У сучасних браузерах це теж може повернути false
+    // (deprecated на http), тоді просто показуємо "виділіть і скопіюйте вручну".
+    const ta = document.createElement("textarea");
+    ta.value = inviteUrl;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "absolute";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
     try {
-      await navigator.clipboard.writeText(inviteUrl);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      ok = document.execCommand("copy");
     } catch {
-      // Fallback для старіших браузерів — просто виділяємо текст.
-      const ta = document.createElement("textarea");
-      ta.value = inviteUrl;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      ta.remove();
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      ok = false;
+    }
+    ta.remove();
+    if (ok) {
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 1500);
+    } else {
+      setCopyState("manual");
+      window.setTimeout(() => setCopyState("idle"), 4000);
     }
   }
 
@@ -40,9 +76,17 @@ export default function RoomControls({
     e.preventDefault();
     const v = draftUrl.trim();
     if (!v) return;
+    pendingUrl.current = v;
     onChangeVideo(v);
-    setDraftUrl("");
+    // НЕ чистимо draftUrl зараз — почекаємо на серверний echo через `currentVideoUrl`.
   }
+
+  const copyLabel =
+    copyState === "copied"
+      ? "Скопійовано"
+      : copyState === "manual"
+        ? "Скопіюй вручну"
+        : "Копіювати посилання";
 
   return (
     <div className="room-controls">
@@ -67,7 +111,7 @@ export default function RoomControls({
           onFocus={(e) => e.currentTarget.select()}
         />
         <button className="button" onClick={copy} type="button">
-          {copied ? "Скопійовано" : "Копіювати посилання"}
+          {copyLabel}
         </button>
       </div>
 
