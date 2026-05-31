@@ -15,6 +15,14 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
    */
   protected suppressDepth = 0;
   /**
+   * Очікувана позиція, яку ми самі виставили через `seek()`. handleSeeked
+   * порівнює з ним фактичний currentTime: якщо відмінність маленька (<0.5с) —
+   * це найвірогідніше micro-seek браузера (HLS chunk boundary, gap-skip),
+   * який не варто бродкастити. Якщо велика — це користувацький seek, шлемо на
+   * сервер. null — ще не було жодного seek (новий адаптер).
+   */
+  protected expectedSeekTarget: number | null = null;
+  /**
    * Якщо load() ще в польоті — це функція, яка викине його promise з rejection
    * і прибере слухачі. destroy() викликає її, щоб не залишити висячих слухачів
    * (loadedmetadata/error) на відкріпленому <video> елементі. Protected, бо
@@ -53,7 +61,19 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
 
   protected handleSeeked = (): void => {
     if (this.suppressDepth > 0) return;
-    this.onSeek?.(this.video.currentTime);
+    const actual = this.video.currentTime;
+    // Порівнюємо з останнім нашим власним seek-target: якщо різниця
+    // маленька (менше за 0.5с) — це практично те ж саме місце, яке вже знає сервер
+    // (наприклад, HLS chunk-boundary re-seek в межах буферизації, або mini-seek
+    // після loadedmetadata для відновлення позиції). Не бродкастимо.
+    if (
+      this.expectedSeekTarget !== null &&
+      Math.abs(actual - this.expectedSeekTarget) < 0.5
+    ) {
+      return;
+    }
+    this.expectedSeekTarget = actual;
+    this.onSeek?.(actual);
   };
 
   /**
@@ -125,6 +145,7 @@ export class HtmlVideoPlayerAdapter implements PlayerAdapter {
 
   async seek(time: number): Promise<void> {
     const release = this.withSuppression();
+    this.expectedSeekTarget = time;
     this.video.currentTime = time;
     // Подія seeked прийде асинхронно; залишаємо guard, поки вона не пройде.
     // Safety net: якщо `seeked` так і не випалить (відео в error state, відкріплене

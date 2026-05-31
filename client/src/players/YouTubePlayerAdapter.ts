@@ -340,7 +340,39 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
     // Оновлюємо lastKnownTime ДО seekTo — щоб у handleStateChange різниця з
     // фактичним currentTime була ~0 і ми не сприйняли seek як користувацький.
     this.lastKnownTime = time;
-    this.player.seekTo(time, true);
+    const player = this.player;
+    player.seekTo(time, true);
+    // YouTube не має `seeked` event, але `getCurrentTime()` реально рухається
+    // до цільової позиції протягом ~200-600ms. Якщо не чекати — подальший play()
+    // (як відповідь на video:play) може почати відтворення від старої позиції, потім
+    // "стрибне" на нову — видимо як glitch. Полімо до ~600ms.
+    await this.waitForSeekSettle(player, time);
+  }
+
+  private waitForSeekSettle(player: YTPlayer, target: number): Promise<void> {
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      const tick = () => {
+        if (!this.player || this.player !== player) {
+          // плеєр знищено або перестворено — виходимо
+          resolve();
+          return;
+        }
+        const actual = (() => {
+          try {
+            return player.getCurrentTime();
+          } catch {
+            return target;
+          }
+        })();
+        if (Math.abs(actual - target) < 0.6 || Date.now() - startedAt > 600) {
+          resolve();
+          return;
+        }
+        window.setTimeout(tick, 80);
+      };
+      window.setTimeout(tick, 80);
+    });
   }
 
   getTime(): number {
