@@ -86,6 +86,12 @@ const VideoPlayer = forwardRef<VideoPlayerHandle, Props>(function VideoPlayer(
     adapter.onPlay = () => cbsRef.current.onLocalPlay();
     adapter.onPause = () => cbsRef.current.onLocalPause();
     adapter.onSeek = (t) => cbsRef.current.onLocalSeek(t);
+    // Runtime-помилки після ready (наприклад, YouTube повертає embedding-disabled,
+    // або HLS зловив fatal-помилку у середині stream). Показуємо інлайн.
+    adapter.onError = (msg) => {
+      if (cancelled) return;
+      cbsRef.current.onError(msg);
+    };
 
     adapter
       .load(url)
