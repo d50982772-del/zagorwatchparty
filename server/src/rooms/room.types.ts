@@ -31,6 +31,10 @@ export interface Room {
 
 /**
  * Те, що ми віддаємо клієнтам, — без Set, тільки серіалізовані поля.
+ *
+ * `serverNow` доданий, щоб клієнт міг порахувати clock skew (відхилення
+ * між ними рівне `serverNow - Date.now()` на момент отримання). Без цього drift
+ * correction помиляється рівно на величину розбіжності годинників.
  */
 export interface RoomStateDTO {
   roomId: string;
@@ -39,6 +43,7 @@ export interface RoomStateDTO {
   isPlaying: boolean;
   currentTime: number;
   updatedAt: number;
+  serverNow: number;
   hostId: string;
   participantsCount: number;
 }
