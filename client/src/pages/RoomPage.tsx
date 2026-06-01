@@ -330,10 +330,15 @@ export default function RoomPage() {
   // лишаються застарілими. Через 5с drift correction обчислює стейл-expected і
   // повертає плеєр на стару позицію — соло-сесія виглядає так, ніби play/seek
   // "відскакують назад".
+  //
+  // ВАЖЛИВО: `updatedAt` має бути у серверному часі, бо `expectedPosition()`
+  // рахує elapsed як `Date.now() + clockSkewMs - updatedAt`. Якщо тут
+  // записати чистий `Date.now()` (client time), drift correction після 5с
+  // помилиться рівно на `clockSkewMs` і знову сіпне плеєр.
   function handleLocalPlay() {
     if (isApplyingRemoteAction()) return;
     const t = playerRef.current?.getTime() ?? 0;
-    const now = Date.now();
+    const now = Date.now() + clockSkewMs.current;
     setRoom((r) => (r ? { ...r, isPlaying: true, currentTime: t, updatedAt: now } : r));
     socket.emit("video:play", { roomId, currentTime: t });
   }
@@ -341,14 +346,14 @@ export default function RoomPage() {
   function handleLocalPause() {
     if (isApplyingRemoteAction()) return;
     const t = playerRef.current?.getTime() ?? 0;
-    const now = Date.now();
+    const now = Date.now() + clockSkewMs.current;
     setRoom((r) => (r ? { ...r, isPlaying: false, currentTime: t, updatedAt: now } : r));
     socket.emit("video:pause", { roomId, currentTime: t });
   }
 
   function handleLocalSeek(time: number) {
     if (isApplyingRemoteAction()) return;
-    const now = Date.now();
+    const now = Date.now() + clockSkewMs.current;
     setRoom((r) => (r ? { ...r, currentTime: time, updatedAt: now } : r));
     socket.emit("video:seek", { roomId, currentTime: time });
   }

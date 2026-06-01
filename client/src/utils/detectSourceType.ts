@@ -11,7 +11,7 @@ export type SourceType = "youtube" | "html5" | "hls" | "unknown";
  * Визначає тип джерела за URL.
  *
  * Підтримуються:
- *  - YouTube (youtube.com/watch?v=..., youtu.be/...)
+ *  - YouTube (youtube.com/watch?v=..., youtu.be/..., youtube.com/embed/...)
  *  - HLS (.m3u8)
  *  - HTML5 (.mp4, .webm, .ogg)
  */
@@ -19,8 +19,14 @@ export function detectSourceType(url: string): SourceType {
   if (!url) return "unknown";
   const lower = url.toLowerCase();
 
-  // YouTube
-  if (lower.includes("youtube.com/watch") || lower.includes("youtu.be/")) {
+  // YouTube — три формати, які підтримує `parseYouTubeId` і вміє грати
+  // `YouTubePlayerAdapter`. Раніше тут було тільки watch/youtu.be — embed
+  // потрапляв в `unknown` і блокувався сервером, хоча адаптер вмів його грати.
+  if (
+    lower.includes("youtube.com/watch") ||
+    lower.includes("youtu.be/") ||
+    lower.includes("youtube.com/embed/")
+  ) {
     return "youtube";
   }
 
