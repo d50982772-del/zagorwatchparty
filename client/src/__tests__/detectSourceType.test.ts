@@ -5,6 +5,10 @@ describe("detectSourceType (client)", () => {
   it("YouTube", () => {
     expect(detectSourceType("https://www.youtube.com/watch?v=dQw4w9WgXcQ")).toBe("youtube");
     expect(detectSourceType("https://youtu.be/dQw4w9WgXcQ")).toBe("youtube");
+    // Embed-URL: парсер id їх підтримує (parseYouTubeId), тому detectSourceType
+    // мусить пропускати їх, інакше адаптер ніколи не отримає вхідних даних.
+    expect(detectSourceType("https://www.youtube.com/embed/dQw4w9WgXcQ")).toBe("youtube");
+    expect(detectSourceType("https://youtube.com/embed/dQw4w9WgXcQ?autoplay=1")).toBe("youtube");
   });
   it("HLS", () => {
     expect(detectSourceType("https://e.com/stream.m3u8")).toBe("hls");

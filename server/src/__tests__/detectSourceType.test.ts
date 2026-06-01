@@ -5,6 +5,11 @@ describe("detectSourceType", () => {
   it("розпізнає YouTube посилання", () => {
     expect(detectSourceType("https://www.youtube.com/watch?v=dQw4w9WgXcQ")).toBe("youtube");
     expect(detectSourceType("https://youtu.be/dQw4w9WgXcQ")).toBe("youtube");
+    // Embed-URL: треба пропускати, бо адаптер їх грає, а парсер id (parseYouTubeId)
+    // вміє витягувати id саме з /embed/. Без цього сервер блокував би їх з
+    // UNSUPPORTED_SOURCE.
+    expect(detectSourceType("https://www.youtube.com/embed/dQw4w9WgXcQ")).toBe("youtube");
+    expect(detectSourceType("https://youtube.com/embed/dQw4w9WgXcQ?autoplay=1")).toBe("youtube");
   });
 
   it("розпізнає HLS (.m3u8)", () => {
