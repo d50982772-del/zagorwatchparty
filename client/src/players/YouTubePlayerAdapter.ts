@@ -30,11 +30,39 @@ interface YTPlayer {
 
 interface YTPlayerOptions {
   videoId: string;
+  width?: string | number;
+  height?: string | number;
   playerVars?: Record<string, unknown>;
   events?: {
     onReady?: (e: { target: YTPlayer }) => void;
     onStateChange?: (e: { data: number; target: YTPlayer }) => void;
+    onError?: (e: { data: number; target: YTPlayer }) => void;
   };
+}
+
+/** YouTube IFrame API error codes:
+ * https://developers.google.com/youtube/iframe_api_reference#onError
+ * 2: invalid parameter
+ * 5: HTML5 player issue
+ * 100: video removed / private
+ * 101 / 150: вбудовування заборонене власником каналу
+ * 153: "video player configuration error" (часто — обмеження для embed) */
+function youtubeErrorMessage(code: number): string {
+  switch (code) {
+    case 2:
+      return "YouTube не зміг розпізнати посилання. Перевір URL відео.";
+    case 5:
+      return "YouTube-плеєр повідомив про внутрішню помилку (HTML5).";
+    case 100:
+      return "Відео не знайдено або зроблено приватним.";
+    case 101:
+    case 150:
+      return "Власник відео заборонив вбудовування. Спробуй інше відео.";
+    case 153:
+      return "YouTube відмовляється відтворювати це відео тут (конфігурація / антибот). Спробуй інше відео.";
+    default:
+      return `YouTube повернув помилку (код ${code}).`;
+  }
 }
 
 /** Якщо очікувана подія так і не приходить (наприклад, YouTube не зміг почати
@@ -126,6 +154,7 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
   onPlay?: () => void;
   onPause?: () => void;
   onSeek?: (time: number) => void;
+  onError?: (msg: string) => void;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -186,6 +215,11 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
 
       const YT = window.YT!;
       this.player = new YT.Player(host, {
+        // YT.Player не наслідує розміри з host — без явних width/height
+        // iframe буде фіксовано 640x390 у HTML-атрибутах. CSS .video-player iframe
+        // нас рятує (width:100%), але кращe одразу задати правильно.
+        width: "100%",
+        height: "100%",
         videoId,
         playerVars: {
           autoplay: 0,
@@ -202,6 +236,25 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
             resolve();
           },
           onStateChange: (e) => this.handleStateChange(e.data),
+          onError: (e) => {
+            const msg = youtubeErrorMessage(e.data);
+            // Якщо помилка прийшла ДО onReady — реджектимо load() з цим
+            // повідомленням (промейс ще висить).
+            if (!settled) {
+              settled = true;
+              cleanup();
+              try {
+                this.player?.destroy();
+              } catch {
+                /* noop */
+              }
+              this.player = null;
+              reject(new Error(msg));
+              return;
+            }
+            // Помилка вже після ready — пробрасуємо через onError-канал.
+            this.onError?.(msg);
+          },
         },
       });
     });
@@ -287,7 +340,39 @@ export class YouTubePlayerAdapter implements PlayerAdapter {
     // Оновлюємо lastKnownTime ДО seekTo — щоб у handleStateChange різниця з
     // фактичним currentTime була ~0 і ми не сприйняли seek як користувацький.
     this.lastKnownTime = time;
-    this.player.seekTo(time, true);
+    const player = this.player;
+    player.seekTo(time, true);
+    // YouTube не має `seeked` event, але `getCurrentTime()` реально рухається
+    // до цільової позиції протягом ~200-600ms. Якщо не чекати — подальший play()
+    // (як відповідь на video:play) може почати відтворення від старої позиції, потім
+    // "стрибне" на нову — видимо як glitch. Полімо до ~600ms.
+    await this.waitForSeekSettle(player, time);
+  }
+
+  private waitForSeekSettle(player: YTPlayer, target: number): Promise<void> {
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      const tick = () => {
+        if (!this.player || this.player !== player) {
+          // плеєр знищено або перестворено — виходимо
+          resolve();
+          return;
+        }
+        const actual = (() => {
+          try {
+            return player.getCurrentTime();
+          } catch {
+            return target;
+          }
+        })();
+        if (Math.abs(actual - target) < 0.6 || Date.now() - startedAt > 600) {
+          resolve();
+          return;
+        }
+        window.setTimeout(tick, 80);
+      };
+      window.setTimeout(tick, 80);
+    });
   }
 
   getTime(): number {

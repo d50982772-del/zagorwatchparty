@@ -21,4 +21,11 @@ export interface PlayerAdapter {
   onPlay?: () => void;
   onPause?: () => void;
   onSeek?: (time: number) => void;
+  /**
+   * Виклик при runtime-помилці ПІСЛЯ того, як load() уже зарезолвився.
+   * Приклади: YouTube повернув "embedding disabled", "video removed",
+   * "configuration error"; HLS не зміг продовжити завантаження сегмента.
+   * Помилки до завершення load() — це reject у load(); ці — це окремий канал.
+   */
+  onError?: (msg: string) => void;
 }

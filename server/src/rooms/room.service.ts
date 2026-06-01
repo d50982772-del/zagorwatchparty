@@ -7,13 +7,16 @@ const generateRoomId = customAlphabet("23456789abcdefghjkmnpqrstuvwxyz", 8);
 
 /**
  * Скільки часу тримати порожню кімнату в пам'яті, перш ніж видалити її.
- * 60 с покриває:
+ * 5 хв покриває:
  *  - React 18 StrictMode mount→cleanup→mount у dev (без цього кімната б видалялася
  *    між cleanup і re-mount і user бачив би "Кімнату не знайдено");
  *  - "осиротілі" кімнати, в яких хост ніколи не викликав room:join;
- *  - короткі мережеві обриви, коли останній учасник відпав і відразу реконнектився.
+ *  - помірні мережеві обриви — sleep ноутбука, рекоонект після переходу між Wi-Fi;
+ *  - повільні reconnect'и socket.io після короткого фейлу.
+ * Раніше було 60с — це не покривало sleep-сценаріїв і користувач бачив
+ * фатальну сторінку "Кімнату не знайдено" після того, як його кімнату свіпнули.
  */
-export const ROOM_GRACE_MS = 60_000;
+export const ROOM_GRACE_MS = 5 * 60_000;
 
 /**
  * In-memory сховище кімнат. Для MVP цього достатньо: при перезапуску сервера
@@ -156,6 +159,7 @@ class RoomService {
       isPlaying: room.isPlaying,
       currentTime: room.currentTime,
       updatedAt: room.updatedAt,
+      serverNow: Date.now(),
       hostId: room.hostId,
       participantsCount: room.participants.size,
     };

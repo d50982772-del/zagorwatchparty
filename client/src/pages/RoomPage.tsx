@@ -13,6 +13,8 @@ interface RoomState {
   isPlaying: boolean;
   currentTime: number;
   updatedAt: number;
+  /** Серверний `Date.now()` на момент відправки DTO. Опційний (старі сервери / події без поля). */
+  serverNow?: number;
   hostId: string;
   participantsCount: number;
 }
@@ -21,12 +23,26 @@ interface RoomState {
  * Рахуємо очікувану позицію відео у кімнаті прямо зараз. Якщо відео грає —
  * треба додати час, який минув з updatedAt. Якщо стоїть на паузі — позиція
  * така ж, як остання збережена.
+ *
+ * `clockSkewMs` — `serverNow - clientNow` з останнього room:state, додається до
+ * Date.now(), щоб локальний `now` був у тому ж часовому базисі, що і `updatedAt`
+ * сервера. Без цього drift correction помилявся б точно на різницю годинників.
  */
-function expectedPosition(state: RoomState): number {
+function expectedPosition(state: RoomState, clockSkewMs = 0): number {
   if (!state.isPlaying) return state.currentTime;
-  const elapsedMs = Date.now() - state.updatedAt;
+  const elapsedMs = Date.now() + clockSkewMs - state.updatedAt;
   return state.currentTime + Math.max(0, elapsedMs) / 1000;
 }
+
+/**
+ * Якщо два послідовних `setInterval`-tick'и drift correction показують різницю
+ * більше за цей поріг — клієнт явно вийшов з синку (швидше за все, через clock
+ * skew або довге зависання вкладки). У цьому випадку шлемо `sync:request`, щоб
+ * сервер прислав авторитативний `sync:correction`.
+ */
+const HEAVY_DRIFT_SECONDS = 5;
+/** М'який поріг drift correction. Менше — ігноруємо, не сіпаємо плеєр. */
+const SOFT_DRIFT_SECONDS = 1.5;
 
 export default function RoomPage() {
   const { roomId = "" } = useParams<{ roomId: string }>();
@@ -34,28 +50,40 @@ export default function RoomPage() {
   const [room, setRoom] = useState<RoomState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
+  /**
+   * Soft error — плашка у плеєрі з кнопкою "Створити нову кімнату". Окремий
+   * стейт від `error` (фатальної сторінки), щоб користувач, якого кімнату
+   * свіпнули після sleep'у, не лишався без опцій.
+   */
+  const [softRoomGone, setSoftRoomGone] = useState(false);
 
   const playerRef = useRef<VideoPlayerHandle | null>(null);
+
+  /** Чи вже бачили хоча б один `room:state` для цієї кімнати. Якщо так — то
+   * наступний `ROOM_NOT_FOUND` — це не фатальна "невірний роут", а м'яка
+   * "кімната пропала" (sweep, рестарт сервера). */
+  const seenRoomState = useRef(false);
+
+  /** Чи плеєр уже зарепортив `onReady`. Drift correction повинен мовчати, поки
+   * плеєр не готовий — інакше `getTime()` повертає 0 і drift сіпає у нікуди. */
+  const playerReady = useRef(false);
+
+  /** Зміщення часу: server.Date.now() - client.Date.now() на момент останнього
+   * `room:state`. Використовується у `expectedPosition`, щоб drift correction
+   * не помилявся на дельту годинників (особливо якщо клієнт у тимчасовій зоні з
+   * NTP-помилкою). Ref, бо потрібен у inner-callback'ах без useEffect перебудови. */
+  const clockSkewMs = useRef(0);
 
   /**
    * Захист від циклічних подій. Коли ми отримуємо команду від сервера і
    * застосовуємо її локально, плеєр може випалити власну play/pause/seek
    * подію — ми не повинні слати її назад.
    *
-   * Лічильник, а не boolean: якщо два remote-event'и накладаються (наприклад,
-   * швидке pause+seek в одного учасника, перші 50ms ще не минули), boolean
-   * скидав би guard передчасно — другий `setTimeout(50)` зняв би прапорець
-   * поки перший ще "у польоті". З depth-counter обидва release'и спершу
-   * декрементять, і `> 0` лишається істинним, поки і другий не релізиться.
+   * Лічильник, а не boolean: якщо два remote-event'и накладаються, boolean
+   * скидав би guard передчасно.
    */
   const remoteActionDepth = useRef(0);
 
-  /**
-   * Інкремент depth, повертає release() з setTimeout-декрементом.
-   * delayMs контролює, скільки тримати guard після завершення await-чейну —
-   * це форум для повільних async-подій плеєра (наприклад YouTube state change
-   * приходить через ~100-500ms після playVideo()).
-   */
   function beginRemoteAction(delayMs = 50): () => void {
     remoteActionDepth.current += 1;
     let released = false;
@@ -68,12 +96,10 @@ export default function RoomPage() {
     };
   }
 
-  /** Чи зараз застосовуємо remote-команду — для guard'ів у локальних обробниках. */
   function isApplyingRemoteAction(): boolean {
     return remoteActionDepth.current > 0;
   }
 
-  // Останній стан кімнати в ref'і — щоб onReady міг прочитати його без closure-stale.
   const roomRef = useRef<RoomState | null>(null);
   roomRef.current = room;
 
@@ -84,28 +110,48 @@ export default function RoomPage() {
 
   // --- Сокети та події кімнати ---
   useEffect(() => {
+    function applyServerNow(state: { serverNow?: number }) {
+      if (typeof state.serverNow === "number") {
+        clockSkewMs.current = state.serverNow - Date.now();
+      }
+    }
+
     function onConnect() {
       setConnected(true);
+      // На свіже з'єднання (включаючи reconnect) — пере-джойн.
       socket.emit("room:join", { roomId });
     }
     function onDisconnect() {
       setConnected(false);
+      // Плеєр треба буде пере-синхронізувати після reconnect: тепер ми не знаємо,
+      // чи стан кімнати у нас актуальний.
+      playerReady.current = false;
     }
 
     function onRoomState(state: RoomState) {
+      applyServerNow(state);
+      seenRoomState.current = true;
+      // Якщо повернулися з soft "кімната пропала" — кімната насправді є,
+      // плашку прибираємо.
+      setSoftRoomGone(false);
       setRoom(state);
     }
 
     function onRoomError(payload: { code: string; message: string }) {
-      // ROOM_NOT_FOUND — фатально (кімнати немає, кімнатну сторінку нічого показувати).
-      // Решта (INVALID_URL і подібні валідаційні помилки) — нефатальні: показуємо
-      // інлайн повідомлення у плеєрі, кімната залишається робочою.
       const msg = payload?.message || "Помилка кімнати";
       if (payload?.code === "ROOM_NOT_FOUND") {
-        setError(msg);
-      } else {
-        setPlayerError(msg);
+        if (seenRoomState.current) {
+          // Ми у кімнаті були. Швидше за все, нас свіпнули після sleep'у /
+          // рестарту сервера. Не показуємо фатал — пропонуємо створити нову.
+          setSoftRoomGone(true);
+        } else {
+          // Зайшли по застарілому посиланню — фатально.
+          setError(msg);
+        }
+        return;
       }
+      // Решта (INVALID_URL / UNSUPPORTED_SOURCE / RATE_LIMITED / ...) — нефатально.
+      setPlayerError(msg);
     }
 
     function onUsersUpdate(payload: { participantsCount: number }) {
@@ -119,6 +165,11 @@ export default function RoomPage() {
       isPlaying: boolean;
       updatedAt: number;
     }) {
+      // Новий URL — плеєр буде перестворено, ready треба нулити.
+      playerReady.current = false;
+      // Користувацька INVALID_URL/UNSUPPORTED_SOURCE-помилка вже неактуальна,
+      // якщо сервер прийняв новий URL.
+      setPlayerError(null);
       setRoom((r) =>
         r
           ? {
@@ -138,7 +189,6 @@ export default function RoomPage() {
       if (!playerRef.current) return;
       const release = beginRemoteAction();
       try {
-        // Підтягуємо позицію перед play, щоб не стартувати "зі старого часу".
         await playerRef.current.seek(payload.currentTime);
         await playerRef.current.play();
       } finally {
@@ -170,9 +220,10 @@ export default function RoomPage() {
     }
 
     async function onSyncCorrection(state: RoomState) {
+      applyServerNow(state);
       setRoom(state);
       if (!playerRef.current || !state.videoUrl) return;
-      const target = expectedPosition(state);
+      const target = expectedPosition(state, clockSkewMs.current);
       const release = beginRemoteAction(100);
       try {
         await playerRef.current.seek(target);
@@ -194,7 +245,6 @@ export default function RoomPage() {
     socket.on("video:seek", onVideoSeek);
     socket.on("sync:correction", onSyncCorrection);
 
-    // Якщо сокет вже підключений на момент монтування — одразу джойнимось.
     if (socket.connected) {
       socket.emit("room:join", { roomId });
     } else {
@@ -212,19 +262,23 @@ export default function RoomPage() {
       socket.off("video:pause", onVideoPause);
       socket.off("video:seek", onVideoSeek);
       socket.off("sync:correction", onSyncCorrection);
-      // Явно виходимо з кімнати на сервері, щоб після навігації не ловити
-      // play/pause/seek зі старої кімнати (сокет клієнта — сінглтон).
       if (socket.connected) {
         socket.emit("room:leave", { roomId });
       }
+      // При зміні roomId / unmount — обнуляємо seen-flag для нового RoomPage
+      // (StrictMode mount→cleanup→mount це передбачає, ми один раз бачили
+      // room:state у попередньому mount, але далі це нова сторінка).
+      seenRoomState.current = false;
+      playerReady.current = false;
     };
   }, [roomId]);
 
   // --- Початкова синхронізація після того, як VideoPlayer сигналізує onReady ---
   async function handlePlayerReady() {
+    playerReady.current = true;
     const r = roomRef.current;
     if (!r || !r.videoUrl || !playerRef.current) return;
-    const target = expectedPosition(r);
+    const target = expectedPosition(r, clockSkewMs.current);
     const release = beginRemoteAction(100);
     try {
       await playerRef.current.seek(target);
@@ -239,24 +293,26 @@ export default function RoomPage() {
   }
 
   // --- Drift correction: раз на 5 секунд звіряємо позицію ---
-  // Залежність — лише `roomId`: інтервал має жити рівно один раз на кімнату.
-  // Якби тут стояло `[room]`, кожен `users:update` / `video:play` / `video:seek`
-  // створював би нову object reference → useEffect перезапускався б → інтервал
-  // постійно скидався і реально ніколи не "достигав" 5 секунд. Актуальний стан
-  // читаємо з `roomRef.current` всередині callback'у.
   useEffect(() => {
     const interval = setInterval(async () => {
       const r = roomRef.current;
       if (!r || !playerRef.current || !r.videoUrl) return;
-      // Не коригуємо, поки ми посеред застосування remote-команди.
+      if (!playerReady.current) return; // плеєр ще не готовий — не сіпаємо
       if (isApplyingRemoteAction()) return;
 
-      const expected = expectedPosition(r);
+      const expected = expectedPosition(r, clockSkewMs.current);
       const actual = playerRef.current.getTime();
       const diff = Math.abs(actual - expected);
 
-      // Поріг 1.5с — нижче нього не чіпаємо, щоб не сіпало.
-      if (diff > 1.5) {
+      // Великий диф — попросимо у сервера авторитативний стан замість того, щоб
+      // самим стрибати. Це покриває кейси, де клієнт довго був у sleep і його
+      // expectedPosition давно неактуальний.
+      if (diff > HEAVY_DRIFT_SECONDS) {
+        socket.emit("sync:request", { roomId });
+        return;
+      }
+      // Малий диф — м'яка локальна корекція без участі сервера.
+      if (diff > SOFT_DRIFT_SECONDS) {
         const release = beginRemoteAction(100);
         try {
           await playerRef.current.seek(expected);
@@ -268,21 +324,32 @@ export default function RoomPage() {
     return () => clearInterval(interval);
   }, [roomId]);
 
-  // --- Локальні події плеєра: відправляємо на сервер ---
+  // --- Локальні події плеєра: відправляємо на сервер + оптимістично оновлюємо локальний стан ---
+  // Без оптимістичного апдейту: sender'у broadcast не приходить (server робить
+  // socket.to, не io.to), і `roomRef.current.isPlaying/currentTime/updatedAt`
+  // лишаються застарілими. Через 5с drift correction обчислює стейл-expected і
+  // повертає плеєр на стару позицію — соло-сесія виглядає так, ніби play/seek
+  // "відскакують назад".
   function handleLocalPlay() {
     if (isApplyingRemoteAction()) return;
     const t = playerRef.current?.getTime() ?? 0;
+    const now = Date.now();
+    setRoom((r) => (r ? { ...r, isPlaying: true, currentTime: t, updatedAt: now } : r));
     socket.emit("video:play", { roomId, currentTime: t });
   }
 
   function handleLocalPause() {
     if (isApplyingRemoteAction()) return;
     const t = playerRef.current?.getTime() ?? 0;
+    const now = Date.now();
+    setRoom((r) => (r ? { ...r, isPlaying: false, currentTime: t, updatedAt: now } : r));
     socket.emit("video:pause", { roomId, currentTime: t });
   }
 
   function handleLocalSeek(time: number) {
     if (isApplyingRemoteAction()) return;
+    const now = Date.now();
+    setRoom((r) => (r ? { ...r, currentTime: time, updatedAt: now } : r));
     socket.emit("video:seek", { roomId, currentTime: time });
   }
 
@@ -326,7 +393,23 @@ export default function RoomPage() {
 
       <main className="room">
         <div className="room__player">
-          {room?.videoUrl ? (
+          {softRoomGone ? (
+            <div className="room__placeholder">
+              <p>
+                Зʼєднання з кімнатою втрачено. Можливо, вона закрилась через
+                бездіяльність. Можна створити нову.
+              </p>
+              <a className="button button--primary" href="/">
+                Створити нову кімнату
+              </a>
+            </div>
+          ) : !connected && !room ? (
+            // Свіже відкриття /room/:id, ще не підключилися — даємо feedback,
+            // а не порожній екран.
+            <div className="room__placeholder">
+              <p>Підключаємось до сервера…</p>
+            </div>
+          ) : room?.videoUrl ? (
             <VideoPlayer
               ref={playerRef}
               url={room.videoUrl}

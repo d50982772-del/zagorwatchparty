@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { socket } from "../socket/socket";
 import { detectSourceType } from "../utils/detectSourceType";
@@ -10,6 +10,11 @@ export default function HomePage() {
   const [connected, setConnected] = useState(socket.connected);
   const navigate = useNavigate();
 
+  /** Атомарний прапор: ми вже завершили (success / error / timeout) поточну
+   * спробу створити кімнату. Захищає від race, де `room:error` приходить разом
+   * з timeout-callback — без прапора користувач бачив би два повідомлення. */
+  const settled = useRef(false);
+
   useEffect(() => {
     function onConnect() {
       setConnected(true);
@@ -19,11 +24,15 @@ export default function HomePage() {
     }
 
     function onCreated({ roomId }: { roomId: string }) {
+      if (settled.current) return;
+      settled.current = true;
       setCreating(false);
       navigate(`/room/${roomId}`);
     }
 
     function onRoomError(payload: { code: string; message: string }) {
+      if (settled.current) return;
+      settled.current = true;
       setCreating(false);
       setError(payload?.message || "Не вдалося створити кімнату");
     }
@@ -44,6 +53,8 @@ export default function HomePage() {
   useEffect(() => {
     if (!creating) return;
     const timeout = window.setTimeout(() => {
+      if (settled.current) return;
+      settled.current = true;
       setCreating(false);
       setError("Сервер не відповів. Перевірте зʼєднання і спробуйте ще раз.");
     }, 10000);
@@ -62,6 +73,7 @@ export default function HomePage() {
       return;
     }
 
+    settled.current = false;
     setCreating(true);
     socket.emit("room:create", { videoUrl: trimmed || undefined });
   }
